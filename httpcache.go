@@ -22,6 +22,7 @@ import (
 const (
 	stale = iota
 	fresh
+	revalidate
 	transparent
 	// XFromCache is the header added to responses that are returned from the cache
 	XFromCache = "X-From-Cache"
@@ -42,9 +43,9 @@ type Cache interface {
 func cacheKey(req *http.Request) string {
 	if req.Method == http.MethodGet {
 		return req.URL.String()
-	} else {
-		return req.Method + " " + req.URL.String()
 	}
+
+	return req.Method + " " + req.URL.String()
 }
 
 // CachedResponse returns the cached http.Response for req if present, and nil
@@ -159,29 +160,14 @@ func (t *Transport) RoundTrip(req *http.Request) (resp *http.Response, err error
 
 		if varyMatches(cachedResp, req) {
 			// Can only use cached value if the new request doesn't Vary significantly
-			freshness := getFreshness(cachedResp.Header, req.Header)
-			if freshness == fresh {
+			switch getFreshness(cachedResp.Header, req.Header) {
+			case fresh:
 				return cachedResp, nil
-			}
-
-			if freshness == stale {
-				var req2 *http.Request
-				// Add validators if caller hasn't already done so
-				etag := cachedResp.Header.Get("etag")
-				if etag != "" && req.Header.Get("etag") == "" {
-					req2 = cloneRequest(req)
-					req2.Header.Set("if-none-match", etag)
-				}
-				lastModified := cachedResp.Header.Get("last-modified")
-				if lastModified != "" && req.Header.Get("last-modified") == "" {
-					if req2 == nil {
-						req2 = cloneRequest(req)
-					}
-					req2.Header.Set("if-modified-since", lastModified)
-				}
-				if req2 != nil {
-					req = req2
-				}
+			case revalidate:
+				go t.revalidate(transport, req, cachedResp, cacheKey)
+				return cachedResp, nil
+			case stale:
+				req = etagHeaders(req, cachedResp)
 			}
 		}
 
@@ -192,11 +178,15 @@ func (t *Transport) RoundTrip(req *http.Request) (resp *http.Response, err error
 			for _, header := range endToEndHeaders {
 				cachedResp.Header[header] = resp.Header[header]
 			}
+			resp.Body.Close()
 			resp = cachedResp
 		} else if (err != nil || (cachedResp != nil && resp.StatusCode >= 500)) &&
 			req.Method == "GET" && canStaleOnError(cachedResp.Header, req.Header) {
 			// In case of transport failure and stale-if-error activated, returns cached content
 			// when available
+			if resp != nil && resp.Body != nil {
+				resp.Body.Close()
+			}
 			return cachedResp, nil
 		} else {
 			if err != nil || resp.StatusCode != http.StatusOK {
@@ -251,6 +241,66 @@ func (t *Transport) RoundTrip(req *http.Request) (resp *http.Response, err error
 		t.Cache.Delete(cacheKey)
 	}
 	return resp, nil
+}
+
+func (t *Transport) revalidate(transport http.RoundTripper, req *http.Request, cachedResp *http.Response, cacheKey string) {
+	resp, err := transport.RoundTrip(etagHeaders(req, cachedResp))
+	if err == nil && req.Method == "GET" && resp.StatusCode == http.StatusNotModified {
+		// Replace the 304 response with the one from cache, but update with some new headers
+		endToEndHeaders := getEndToEndHeaders(resp.Header)
+		for _, header := range endToEndHeaders {
+			cachedResp.Header[header] = resp.Header[header]
+		}
+		resp.Body.Close()
+		resp = cachedResp
+	} else if (err != nil || (cachedResp != nil && resp.StatusCode >= 500)) &&
+		req.Method == "GET" && canStaleOnError(cachedResp.Header, req.Header) {
+		if resp != nil && resp.Body != nil {
+			resp.Body.Close()
+		}
+		return
+	} else {
+		t.Cache.Delete(cacheKey)
+		return
+	}
+
+	if canStore(parseCacheControl(req.Header), parseCacheControl(resp.Header)) {
+		for _, varyKey := range headerAllCommaSepValues(resp.Header, "vary") {
+			varyKey = http.CanonicalHeaderKey(varyKey)
+			fakeHeader := "X-Varied-" + varyKey
+			reqValue := req.Header.Get(varyKey)
+			if reqValue != "" {
+				resp.Header.Set(fakeHeader, reqValue)
+			}
+		}
+		respBytes, err := httputil.DumpResponse(resp, true)
+		if err == nil {
+			t.Cache.Set(cacheKey, respBytes)
+		}
+	} else {
+		t.Cache.Delete(cacheKey)
+	}
+}
+
+func etagHeaders(req *http.Request, cachedResp *http.Response) *http.Request {
+	var req2 *http.Request
+	// Add validators if caller hasn't already done so
+	etag := cachedResp.Header.Get("etag")
+	if etag != "" && req.Header.Get("etag") == "" {
+		req2 = cloneRequest(req)
+		req2.Header.Set("if-none-match", etag)
+	}
+	lastModified := cachedResp.Header.Get("last-modified")
+	if lastModified != "" && req.Header.Get("last-modified") == "" {
+		if req2 == nil {
+			req2 = cloneRequest(req)
+		}
+		req2.Header.Set("if-modified-since", lastModified)
+	}
+	if req2 != nil {
+		return req2
+	}
+	return req
 }
 
 // ErrNoDateHeader indicates that the HTTP headers contained no Date header.
@@ -364,6 +414,21 @@ func getFreshness(respHeaders, reqHeaders http.Header) (freshness int) {
 
 	if lifetime > currentAge {
 		return fresh
+	}
+
+	if staleMaxAge, ok := respCacheControl["stale-while-revalidate"]; ok {
+		if staleMaxAge != "" {
+			staleDuration, err := time.ParseDuration(staleMaxAge + "s")
+			if err != nil {
+				return stale
+			}
+			lifetime = lifetime + staleDuration
+			if lifetime > currentAge {
+				return revalidate
+			}
+		} else {
+			return revalidate
+		}
 	}
 
 	return stale
@@ -533,7 +598,7 @@ type cachingReadCloser struct {
 func (r *cachingReadCloser) Read(p []byte) (n int, err error) {
 	n, err = r.R.Read(p)
 	r.buf.Write(p[:n])
-	if err == io.EOF {
+	if err == io.EOF || n < len(p) {
 		r.OnEOF(bytes.NewReader(r.buf.Bytes()))
 	}
 	return n, err

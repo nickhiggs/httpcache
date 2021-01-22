@@ -2,6 +2,7 @@ package httpcache
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"flag"
 	"io"
@@ -157,6 +158,15 @@ func setup() {
 				w.Write([]byte{0})
 			}
 		}
+	}))
+
+	mux.HandleFunc("/json", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "max-age=3600")
+		w.Header().Set("Content-Type", "application/json")
+		// This will force using bufio.Read() instead of chunkedReader.Read()
+		// to miss the EOF.
+		w.Header().Set("Transfer-encoding", "identity")
+		json.NewEncoder(w).Encode(map[string]string{"k": "v"})
 	}))
 }
 
@@ -394,6 +404,43 @@ func TestCacheOnlyIfBodyRead(t *testing.T) {
 		defer resp.Body.Close()
 		if resp.Header.Get(XFromCache) != "" {
 			t.Fatalf("XFromCache header isn't blank")
+		}
+	}
+}
+
+func TestCacheOnJsonBodyRead(t *testing.T) {
+	resetTest()
+	{
+		req, err := http.NewRequest("GET", s.server.URL+"/json", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := s.client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var r json.RawMessage
+		err = json.NewDecoder(resp.Body).Decode(&r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resp.Header.Get(XFromCache) != "" {
+			t.Fatalf("XFromCache header isn't blank")
+		}
+	}
+	{
+		req, err := http.NewRequest("GET", s.server.URL+"/json", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := s.client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		if resp.Header.Get(XFromCache) != "1" {
+			t.Fatalf("XFromCache header isn't set")
 		}
 	}
 }
@@ -1234,6 +1281,79 @@ func TestStaleIfErrorRequest(t *testing.T) {
 	}
 	if resp == nil {
 		t.Fatal("resp is nil")
+	}
+}
+
+func TestReqStaleRevalidate(t *testing.T) {
+	resetTest()
+	now := time.Now()
+	respHeaders := http.Header{
+		"Date":          []string{now.Format(time.RFC1123)},
+		"Cache-Control": []string{"stale-while-revalidate"},
+	}
+	reqHeaders := http.Header{}
+	if getFreshness(respHeaders, reqHeaders) != revalidate {
+		t.Fatal("freshness isn't revalidate")
+	}
+}
+
+func TestStaleWhileRevalidateRequest(t *testing.T) {
+	resetTest()
+	now := time.Now()
+	tmock := transportMock{
+		response: &http.Response{
+			Status:     http.StatusText(http.StatusOK),
+			StatusCode: http.StatusOK,
+			Header: http.Header{
+				"Date":          []string{now.Format(time.RFC1123)},
+				"Cache-Control": []string{"stale-while-revalidate"},
+			},
+			Body: ioutil.NopCloser(bytes.NewBuffer([]byte("some data"))),
+		},
+		err: nil,
+	}
+	tp := NewMemoryCacheTransport()
+	tp.Transport = &tmock
+
+	// First time, response is cached on success
+	r, _ := http.NewRequest("GET", "http://somewhere.com/", nil)
+	resp, err := tp.RoundTrip(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp == nil {
+		t.Fatal("resp is nil")
+	}
+	_, err = ioutil.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// On revalidate, response is returned from the cache
+	tmock.response = &http.Response{
+		Status:     http.StatusText(http.StatusForbidden),
+		StatusCode: http.StatusForbidden,
+	}
+	resp, err = tp.RoundTrip(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp == nil {
+		t.Fatal("resp is nil")
+	} else if resp.StatusCode != http.StatusOK {
+		t.Fatal("resp status is not ok")
+	}
+
+	// Next request returns 403 response
+	time.Sleep(1 * time.Second)
+	resp, err = tp.RoundTrip(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp == nil {
+		t.Fatal("resp is nil")
+	} else if resp.StatusCode != http.StatusForbidden {
+		t.Fatal("resp status is not forbidden")
 	}
 }
 
